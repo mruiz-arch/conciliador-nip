@@ -7,7 +7,6 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 
-
 st.set_page_config(page_title="Conciliador NIP vs Agente", layout="wide")
 
 
@@ -32,19 +31,17 @@ def normalizar_importe(x):
     if s == "":
         return 0.0
 
-    # limpia moneda y espacios
     s = s.replace("USD", "").replace("US$", "").replace("$", "").replace(" ", "")
 
-    # casos 1.234,56
+    if "(" in s and ")" in s:
+        s = "-" + s.replace("(", "").replace(")", "")
+
     if "," in s and "." in s:
         if s.rfind(",") > s.rfind("."):
             s = s.replace(".", "").replace(",", ".")
         else:
             s = s.replace(",", "")
-
-    # casos 1,234.56
     elif "," in s and "." not in s:
-        # si parece decimal con coma
         partes = s.split(",")
         if len(partes[-1]) in (1, 2):
             s = s.replace(".", "").replace(",", ".")
@@ -84,15 +81,40 @@ def buscar_columna(df, aliases, obligatoria=True):
     return None
 
 
+def detectar_columna_sis_directa(df):
+    patrones = [
+        "NRO OPERACION", "OPERACION", "NRO OPERACIÓN", "SIS", "NRO SIS",
+        "N° SIS", "NRO DE OPERACION", "NRO DE OPERACIÓN", "OPERACIÓN"
+    ]
+    for p in patrones:
+        col = buscar_columna(df, [p], obligatoria=False)
+        if col:
+            return col
+    return None
+
+
+# =========================
+# Preparación de hojas
+# =========================
 def preparar_hoja_agente(df):
-    """
-    Espera encontrar algo equivalente a:
-    JOB NO | MBL | NRO SIS | TOTAL
-    """
-    col_job = buscar_columna(df, ["JOB NO", "JOB", "COMPROBANTE", "FACTURA", "NRO JOB"], obligatoria=False)
-    col_mbl = buscar_columna(df, ["MBL", "MASTER", "MASTER BL", "MASTER BILL"], obligatoria=False)
-    col_sis = buscar_columna(df, ["NRO SIS", "SIS", "N° SIS", "NUMERO SIS", "NRO OPERACION", "OPERACION"])
-    col_total = buscar_columna(df, ["TOTAL", "IMPORTE", "TOTAL AGENTE", "SALDO", "MONTO"])
+    col_job = buscar_columna(
+        df,
+        ["JOB NO", "JOB", "COMPROBANTE", "FACTURA", "NRO JOB", "JOB NUMBER"],
+        obligatoria=False
+    )
+    col_mbl = buscar_columna(
+        df,
+        ["MBL", "MASTER", "MASTER BL", "MASTER BILL"],
+        obligatoria=False
+    )
+    col_sis = buscar_columna(
+        df,
+        ["NRO SIS", "SIS", "N° SIS", "NUMERO SIS", "NRO OPERACION", "OPERACION"]
+    )
+    col_total = buscar_columna(
+        df,
+        ["TOTAL", "IMPORTE", "TOTAL AGENTE", "SALDO", "MONTO"]
+    )
 
     out = pd.DataFrame()
     out["JOB NO"] = df[col_job] if col_job else ""
@@ -110,20 +132,31 @@ def preparar_hoja_agente(df):
 
 
 def preparar_hoja_nip(df):
-    """
-    Espera encontrar algo equivalente a:
-    NRO OPERACION | COMPROBANTE | MASTER | HOUSE | FECHA EMISION | MONEDA | TOTAL
-    """
-    col_op = buscar_columna(df, ["NRO OPERACION", "OPERACION", "NRO OPERACIÓN", "SIS", "NRO SIS"])
+    def buscar_sis_en_fila(row):
+        for val in row:
+            if pd.isna(val):
+                continue
+            encontrados = re.findall(r"SIS\d{8,}", str(val).upper())
+            if encontrados:
+                return encontrados[0]
+        return ""
+
+    col_total = buscar_columna(df, ["TOTAL", "IMPORTE", "TOTAL NIP", "SALDO", "MONTO"])
+
+    col_op = detectar_columna_sis_directa(df)
     col_comp = buscar_columna(df, ["COMPROBANTE", "FACTURA", "NRO FACTURA"], obligatoria=False)
     col_master = buscar_columna(df, ["MASTER", "MBL", "MASTER BL"], obligatoria=False)
     col_house = buscar_columna(df, ["HOUSE", "HBL"], obligatoria=False)
     col_fecha = buscar_columna(df, ["FECHA EMISION", "FECHA", "EMISION"], obligatoria=False)
     col_moneda = buscar_columna(df, ["MONEDA"], obligatoria=False)
-    col_total = buscar_columna(df, ["TOTAL", "IMPORTE", "TOTAL NIP", "SALDO", "MONTO"])
 
     out = pd.DataFrame()
-    out["NRO OPERACION"] = df[col_op].apply(normalizar_texto)
+
+    if col_op:
+        out["NRO OPERACION"] = df[col_op].apply(lambda x: primer_sis(x) if primer_sis(x) else normalizar_texto(x))
+    else:
+        out["NRO OPERACION"] = df.apply(buscar_sis_en_fila, axis=1)
+
     out["COMPROBANTE"] = df[col_comp].apply(normalizar_texto) if col_comp else ""
     out["MASTER"] = df[col_master].apply(normalizar_texto) if col_master else ""
     out["HOUSE"] = df[col_house].apply(normalizar_texto) if col_house else ""
@@ -131,23 +164,28 @@ def preparar_hoja_nip(df):
     out["MONEDA"] = df[col_moneda].apply(normalizar_texto) if col_moneda else ""
     out["TOTAL NIP"] = df[col_total].apply(normalizar_importe)
 
+    out["NRO OPERACION"] = out["NRO OPERACION"].apply(normalizar_texto)
+
     return out
 
 
+# =========================
+# Conciliación
+# =========================
 def conciliar(df_agente_raw, df_nip_raw):
     agente = preparar_hoja_agente(df_agente_raw)
     nip = preparar_hoja_nip(df_nip_raw)
 
-    # Revisar manual: SIS múltiples en agente
     revisar_manual = agente[agente["NRO SIS ORIGINAL"].apply(es_sis_multiple)].copy()
     revisar_manual["NOTA"] = "Buscar manualmente en Hoja 2 por BL o sufijos del SIS"
 
     agente_simple = agente[~agente["NRO SIS ORIGINAL"].apply(es_sis_multiple)].copy()
     agente_simple = agente_simple[agente_simple["NRO SIS (Agente)"] != ""].copy()
 
-    # agrupar NIP por NRO OPERACION
+    nip_valid = nip[nip["NRO OPERACION"] != ""].copy()
+
     nip_group = (
-        nip.groupby("NRO OPERACION", as_index=False)
+        nip_valid.groupby("NRO OPERACION", as_index=False)
         .agg({
             "COMPROBANTE": lambda x: " | ".join(sorted({str(v) for v in x if str(v).strip() != ""})),
             "MASTER": lambda x: " | ".join(sorted({str(v) for v in x if str(v).strip() != ""})),
@@ -166,57 +204,57 @@ def conciliar(df_agente_raw, df_nip_raw):
     )
 
     base["TOTAL NIP"] = base["TOTAL NIP"].fillna(0.0)
-
-    # importante: compara magnitud, porque en tu ejemplo agente y NIP suelen venir con signo opuesto
     base["DIFERENCIA"] = (base["TOTAL Agente"].abs() - base["TOTAL NIP"].abs()).round(2)
 
     coincidentes_ok = base[
         (base["NRO OPERACION"].notna()) &
+        (base["NRO OPERACION"] != "") &
         (base["DIFERENCIA"].abs() <= 0.01)
     ].copy()
 
     con_diferencia = base[
         (base["NRO OPERACION"].notna()) &
+        (base["NRO OPERACION"] != "") &
         (base["DIFERENCIA"].abs() > 0.01)
     ].copy()
 
-    solo_agente = base[base["NRO OPERACION"].isna()].copy()
+    solo_agente = base[
+        (base["NRO OPERACION"].isna()) | (base["NRO OPERACION"] == "")
+    ].copy()
 
-    # solo NIP
     usados = set(base["NRO OPERACION"].dropna().astype(str))
-    solo_nip = nip[~nip["NRO OPERACION"].astype(str).isin(usados)].copy()
+    solo_nip = nip_valid[~nip_valid["NRO OPERACION"].astype(str).isin(usados)].copy()
 
-    # columnas finales
-    coincidentes_ok_final = coincidentes_ok[[
-        "JOB NO", "MBL", "NRO SIS (Agente)", "NRO OPERACION", "TOTAL Agente", "TOTAL NIP", "DIFERENCIA"
-    ]].copy()
+    coincidentes_ok_final = coincidentes_ok[
+        ["JOB NO", "MBL", "NRO SIS (Agente)", "NRO OPERACION", "TOTAL Agente", "TOTAL NIP", "DIFERENCIA"]
+    ].copy()
     coincidentes_ok_final["NOTA"] = ""
 
-    con_diferencia_final = con_diferencia[[
-        "JOB NO", "MBL", "NRO SIS (Agente)", "NRO OPERACION", "TOTAL Agente", "TOTAL NIP", "DIFERENCIA", "COMPROBANTE"
-    ]].copy()
+    con_diferencia_final = con_diferencia[
+        ["JOB NO", "MBL", "NRO SIS (Agente)", "NRO OPERACION", "TOTAL Agente", "TOTAL NIP", "DIFERENCIA", "COMPROBANTE"]
+    ].copy()
     con_diferencia_final.rename(columns={"COMPROBANTE": "COMPROBANTES NIP"}, inplace=True)
     con_diferencia_final["NOTA"] = ""
 
-    solo_agente_final = solo_agente[[
-        "JOB NO", "MBL", "NRO SIS (Agente)", "TOTAL Agente"
-    ]].copy()
+    solo_agente_final = solo_agente[
+        ["JOB NO", "MBL", "NRO SIS (Agente)", "TOTAL Agente"]
+    ].copy()
     solo_agente_final["NOTA"] = ""
 
-    solo_nip_final = solo_nip[[
-        "NRO OPERACION", "COMPROBANTE", "MASTER", "HOUSE", "FECHA EMISION", "MONEDA", "TOTAL NIP"
-    ]].copy()
+    solo_nip_final = solo_nip[
+        ["NRO OPERACION", "COMPROBANTE", "MASTER", "HOUSE", "FECHA EMISION", "MONEDA", "TOTAL NIP"]
+    ].copy()
 
-    revisar_manual_final = revisar_manual[[
-        "JOB NO", "MBL", "NRO SIS ORIGINAL", "TOTAL Agente", "NOTA"
-    ]].copy()
+    revisar_manual_final = revisar_manual[
+        ["JOB NO", "MBL", "NRO SIS ORIGINAL", "TOTAL Agente", "NOTA"]
+    ].copy()
     revisar_manual_final.rename(columns={"NRO SIS ORIGINAL": "NRO SIS COMPLETO (Agente)"}, inplace=True)
 
     resumen = {
         "reg_agente": int(len(agente)),
         "imp_agente": round(float(agente["TOTAL Agente"].sum()), 2),
-        "reg_nip": int(len(nip)),
-        "imp_nip": round(float(nip["TOTAL NIP"].sum()), 2),
+        "reg_nip": int(len(nip_valid)),
+        "imp_nip": round(float(nip_valid["TOTAL NIP"].sum()), 2),
         "ok_reg": int(len(coincidentes_ok_final)),
         "ok_imp_ag": round(float(coincidentes_ok_final["TOTAL Agente"].sum()), 2) if not coincidentes_ok_final.empty else 0.0,
         "ok_imp_nip": round(float(coincidentes_ok_final["TOTAL NIP"].sum()), 2) if not coincidentes_ok_final.empty else 0.0,
@@ -262,7 +300,7 @@ def auto_ancho(ws):
                 max_len = max(max_len, len(val))
             except:
                 pass
-        ws.column_dimensions[col_letter].width = min(max_len + 2, 35)
+        ws.column_dimensions[col_letter].width = min(max_len + 2, 40)
 
 
 def escribir_dataframe(ws, df, start_row, start_col=1, include_header=True):
@@ -294,10 +332,9 @@ def generar_excel(resultado):
     solo_nip = resultado["solo_nip"]
     rev = resultado["revisar_manual"]
 
-    # Resumen
     ws["A1"] = "CONCILIACIÓN DE CUENTAS — UNION CARGO INTERNATIONAL"
-    ws["A2"] = "Cuenta Agente (Hoja 1)  vs  Cuenta NIP (Hoja 2)"
-    ws["A3"] = "⚡ Match por NRO SIS base | SIS múltiple → Revisar Manual"
+    ws["A2"] = "Cuenta Agente (Hoja 1) vs Cuenta NIP (Hoja 2)"
+    ws["A3"] = "Match por NRO SIS | SIS múltiple → Revisar Manual"
 
     ws["A5"] = "CONCEPTO"
     ws["B5"] = "REGISTROS"
@@ -307,11 +344,11 @@ def generar_excel(resultado):
     resumen_rows = [
         ["Cuenta Agente (Hoja 1)", resumen["reg_agente"], resumen["imp_agente"]],
         ["Cuenta NIP (Hoja 2)", resumen["reg_nip"], resumen["imp_nip"]],
-        ["✅ Coincidentes OK", resumen["ok_reg"], resumen["ok_imp_ag"]],
-        ["⚠️ Con Diferencia", resumen["dif_reg"], resumen["dif_imp_ag"]],
-        ["📋 Solo Agente", resumen["solo_ag_reg"], resumen["solo_ag_imp"]],
-        ["📋 Solo NIP", resumen["solo_nip_reg"], resumen["solo_nip_imp"]],
-        ["🔍 Revisar Manual", resumen["rev_reg"], resumen["rev_imp"]],
+        ["Coincidentes OK", resumen["ok_reg"], resumen["ok_imp_ag"]],
+        ["Con Diferencia", resumen["dif_reg"], resumen["dif_imp_ag"]],
+        ["Solo Agente", resumen["solo_ag_reg"], resumen["solo_ag_imp"]],
+        ["Solo NIP", resumen["solo_nip_reg"], resumen["solo_nip_imp"]],
+        ["Revisar Manual", resumen["rev_reg"], resumen["rev_imp"]],
     ]
 
     fila = 6
@@ -328,49 +365,50 @@ def generar_excel(resultado):
 
     auto_ancho(ws)
 
-    # Coincidentes
-    ws_ok = wb.create_sheet("✅ Coincidentes OK")
+    ws_ok = wb.create_sheet("Coincidentes OK")
     ws_ok["A1"] = f"COINCIDENTES SIN DIFERENCIA — {len(ok)} registros"
     escribir_dataframe(ws_ok, ok, start_row=2)
-    aplicar_estilo_titulo(ws_ok, f"A2:H2")
+    if len(ok.columns) > 0:
+        aplicar_estilo_titulo(ws_ok, f"A2:{get_column_letter(len(ok.columns))}2")
     auto_ancho(ws_ok)
 
-    # Diferencia
-    ws_dif = wb.create_sheet("⚠️ Con Diferencia")
+    ws_dif = wb.create_sheet("Con Diferencia")
     ws_dif["A1"] = f"COINCIDENTES CON DIFERENCIA DE IMPORTE — {len(dif)} registros"
     escribir_dataframe(ws_dif, dif, start_row=2)
-    aplicar_estilo_titulo(ws_dif, f"A2:I2")
+    if len(dif.columns) > 0:
+        aplicar_estilo_titulo(ws_dif, f"A2:{get_column_letter(len(dif.columns))}2")
     auto_ancho(ws_dif)
 
-    # Solo Agente
-    ws_sa = wb.create_sheet("📋 Solo Agente")
+    ws_sa = wb.create_sheet("Solo Agente")
     ws_sa["A1"] = f"SOLO EN CUENTA AGENTE — {len(solo_ag)} registros"
     escribir_dataframe(ws_sa, solo_ag, start_row=2)
-    aplicar_estilo_titulo(ws_sa, f"A2:E2")
+    if len(solo_ag.columns) > 0:
+        aplicar_estilo_titulo(ws_sa, f"A2:{get_column_letter(len(solo_ag.columns))}2")
     total_row = len(solo_ag) + 3
     ws_sa.cell(total_row, 1, "TOTAL")
-    ws_sa.cell(total_row, 4, f"=SUM(D3:D{total_row-1})")
+    if len(solo_ag) > 0:
+        ws_sa.cell(total_row, 4, f"=SUM(D3:D{total_row-1})")
     auto_ancho(ws_sa)
 
-    # Solo NIP
-    ws_sn = wb.create_sheet("📋 Solo NIP")
+    ws_sn = wb.create_sheet("Solo NIP")
     ws_sn["A1"] = f"SOLO EN CUENTA NIP — {len(solo_nip)} registros"
     escribir_dataframe(ws_sn, solo_nip, start_row=2)
-    aplicar_estilo_titulo(ws_sn, f"A2:G2")
+    if len(solo_nip.columns) > 0:
+        aplicar_estilo_titulo(ws_sn, f"A2:{get_column_letter(len(solo_nip.columns))}2")
     auto_ancho(ws_sn)
 
-    # Revisar manual
-    ws_rm = wb.create_sheet("🔍 Revisar Manual")
+    ws_rm = wb.create_sheet("Revisar Manual")
     ws_rm["A1"] = f"REVISAR MANUALMENTE — {len(rev)} registros con SIS múltiple"
-    ws_rm["A2"] = "⚠️ Tienen múltiples NRO SIS agrupados. Verificar manualmente en Hoja 2 por BL o sufijos."
+    ws_rm["A2"] = "Tienen múltiples NRO SIS agrupados. Verificar manualmente en Hoja 2 por BL o sufijos."
     escribir_dataframe(ws_rm, rev, start_row=3)
-    aplicar_estilo_titulo(ws_rm, f"A3:E3")
+    if len(rev.columns) > 0:
+        aplicar_estilo_titulo(ws_rm, f"A3:{get_column_letter(len(rev.columns))}3")
     total_row_rm = len(rev) + 4
     ws_rm.cell(total_row_rm, 1, "TOTAL")
-    ws_rm.cell(total_row_rm, 4, f"=SUM(D4:D{total_row_rm-1})")
+    if len(rev) > 0:
+        ws_rm.cell(total_row_rm, 4, f"=SUM(D4:D{total_row_rm-1})")
     auto_ancho(ws_rm)
 
-    # formato números
     for hoja in [ws, ws_ok, ws_dif, ws_sa, ws_sn, ws_rm]:
         for row in hoja.iter_rows():
             for cell in row:
@@ -393,20 +431,16 @@ archivo = st.file_uploader("Subir archivo base", type=["xlsx"])
 
 with st.expander("Formato esperado"):
     st.markdown("""
-**Hoja 1 (Agente)** debe tener columnas equivalentes a:
+**Hoja 1 (Agente)** debe tener alguna columna equivalente a:
 - JOB NO
 - MBL
 - NRO SIS
 - TOTAL
 
-**Hoja 2 (NIP)** debe tener columnas equivalentes a:
-- NRO OPERACION
-- COMPROBANTE
-- MASTER
-- HOUSE
-- FECHA EMISION
-- MONEDA
+**Hoja 2 (NIP)** debe tener al menos:
 - TOTAL
+
+Y si no tiene una columna llamada NRO OPERACION, la app intenta encontrar el SIS automáticamente dentro de cualquier columna.
 """)
 
 if archivo:
@@ -433,11 +467,21 @@ if archivo:
             c4.metric("Solo NIP", len(resultado["solo_nip"]))
 
             st.subheader("Vista previa")
-            st.write("✅ Coincidentes OK")
+
+            st.write("Coincidentes OK")
             st.dataframe(resultado["coincidentes_ok"], use_container_width=True)
 
-            st.write("⚠️ Con Diferencia")
+            st.write("Con Diferencia")
             st.dataframe(resultado["con_diferencia"], use_container_width=True)
+
+            st.write("Solo Agente")
+            st.dataframe(resultado["solo_agente"], use_container_width=True)
+
+            st.write("Solo NIP")
+            st.dataframe(resultado["solo_nip"], use_container_width=True)
+
+            st.write("Revisar Manual")
+            st.dataframe(resultado["revisar_manual"], use_container_width=True)
 
             excel_final = generar_excel(resultado)
 
